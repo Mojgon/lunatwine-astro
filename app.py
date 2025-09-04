@@ -1,11 +1,10 @@
-import math, datetime, time
+import datetime, time, os
 from collections import deque, defaultdict
+
 from flask import Flask, request, jsonify
 from geopy.geocoders import Nominatim
-from timezonefinder import TimezoneFinder
 import pytz
-import os
-import swisseph as swe
+import swisseph as swe  # pyswisseph
 
 app = Flask(__name__)
 
@@ -45,13 +44,18 @@ ASPECTS = [(0,"conjunction"),(60,"sextile"),(90,"square"),(120,"trine"),(180,"op
 NATAL_ORB = 6.0
 TRANSIT_ORB = 3.0
 
-def norm360(d): d = d % 360.0; return d + 360.0 if d < 0 else d
+def norm360(d):
+    d = d % 360.0
+    return d + 360.0 if d < 0 else d
+
 def sign_name(lon):
     s = int(lon // 30) % 12
     return SIGNS[s], lon % 30
+
 def aspect_between(a, b, orb):
     d = abs(a - b) % 360.0
-    if d > 180: d = 360 - d
+    if d > 180:
+        d = 360 - d
     for ang, name in ASPECTS:
         diff = abs(d - ang)
         if diff <= orb:
@@ -59,10 +63,12 @@ def aspect_between(a, b, orb):
     return None, None
 
 def geocode(city, country, user_agent_email="contact@lunatwine.com"):
+    """Optional: try to resolve lat/lon if not provided; OK to remove later."""
     geocoder = Nominatim(user_agent=f"lunatwine/1.0 ({user_agent_email})", timeout=10)
     q = f"{city}, {country}" if country else city
     loc = geocoder.geocode(q)
-    if not loc: return None
+    if not loc:
+        return None
     return float(loc.latitude), float(loc.longitude)
 
 def local_to_ut(date_str, time_str, tz_name):
@@ -85,26 +91,39 @@ def planet_positions(jd_ut, orb=NATAL_ORB):
     for name, pid in PLANETS:
         lon, latp, dist, speed = swe.calc_ut(jd_ut, pid, iflag)[0:4]
         sname, deg = sign_name(lon)
-        out.append({"name": name, "lon": norm360(lon), "sign": sname,
-                    "deg_in_sign": round(deg,2), "speed": speed})
+        out.append({
+            "name": name,
+            "lon": round(norm360(lon), 6),
+            "sign": sname,
+            "deg_in_sign": round(deg, 2),
+            "speed": speed
+        })
     return out
 
 def natal_payload(p, require_geo=True):
-    date = p.get("date"); time = p.get("time")
-    city = (p.get("city") or "").strip(); country = (p.get("country") or "").strip()
-    tz_name = p.get("timezone")
-    if not (date and time and tz_name):
-        return None, {"error":"date, time, and timezone are required"}
-    lat = p.get("lat"); lon = p.get("lon")
+    date = p.get("date")
+    time_s = p.get("time")
+    city = (p.get("city") or "").strip()
+    country = (p.get("country") or "").strip()
+    tz_name = (p.get("timezone") or "").strip()
+
+    if not (date and time_s and tz_name):
+        return None, {"error": "date, time, and timezone are required"}
+
+    lat = p.get("lat")
+    lon = p.get("lon")
     if (lat is None or lon is None) and require_geo:
         gc = geocode(city, country)
-        if not gc: return None, {"error":"Could not geocode city/country"}
+        if not gc:
+            return None, {"error": "Could not geocode city/country"}
         lat, lon = gc
+
     try:
-        jd_ut, ut_dt = local_to_ut(date, time, tz_name)
+        jd_ut, ut_dt = local_to_ut(date, time_s, tz_name)
     except Exception as e:
-        return None, {"error":f"Time conversion failed: {e}"}
-    return {"lat":lat,"lon":lon,"tz":tz_name,"jd_ut":jd_ut,"ut_dt":ut_dt}, None
+        return None, {"error": f"Time conversion failed: {e}"}
+
+    return {"lat": lat, "lon": lon, "tz": tz_name, "jd_ut": jd_ut, "ut_dt": ut_dt}, None
 
 # ------------ endpoints ------------
 @app.get("/health")
@@ -114,53 +133,64 @@ def health():
 @app.post("/natal")
 def natal():
     ip = request.remote_addr or "anon"
-    if not check_rate(ip): return jsonify({"error":"rate limit"}), 429
-    if not require_key(): return jsonify({"error":"unauthorized"}), 401
+    if not check_rate(ip):
+        return jsonify({"error": "rate limit"}), 429
+    if not require_key():
+        return jsonify({"error": "unauthorized"}), 401
     try:
         p = request.get_json(force=True)
     except Exception:
-        return jsonify({"error":"Invalid JSON"}), 400
+        return jsonify({"error": "Invalid JSON"}), 400
 
     basis, err = natal_payload(p)
-    if err: return jsonify(err), 400
-    lat, lon, tz_name, jd_ut, ut_dt = basis["lat"], basis["lon"], basis["tz"], basis["jd_ut"], basis["ut_dt"]
+    if err:
+        return jsonify(err), 400
+
+    lat, lon = basis["lat"], basis["lon"]
+    tz_name, jd_ut, ut_dt = basis["tz"], basis["jd_ut"], basis["ut_dt"]
 
     cusps, ascv, mcv = houses_placidus(jd_ut, lat, lon)
     planets = planet_positions(jd_ut, NATAL_ORB)
 
     # assign houses
     def house_for(L, cusps):
-      L = norm360(L)
-      c = [norm360(x) for x in cusps]
-      c2 = c + [c[0] + 360]
-      for i in range(12):
-          a,b = c2[i], c2[i+1]
-          if a <= L < b or (b < a and (L >= a or L < b % 360)):
-              return i+1
-      return 12
+        L = norm360(L)
+        c = [norm360(x) for x in cusps]
+        c2 = c + [c[0] + 360]
+        for i in range(12):
+            a, b = c2[i], c2[i+1]
+            if a <= L < b or (b < a and (L >= a or L < (b % 360))):
+                return i + 1
+        return 12
+
     for pl in planets:
-      pl["house"] = house_for(pl["lon"], cusps)
+        pl["house"] = house_for(pl["lon"], cusps)
 
     # natal aspects
     aspects = []
     for i in range(len(planets)):
-        for j in range(i+1,len(planets)):
+        for j in range(i + 1, len(planets)):
             typ, orb = aspect_between(planets[i]["lon"], planets[j]["lon"], NATAL_ORB)
             if typ:
-                aspects.append({"a":planets[i]["name"], "b":planets[j]["name"], "type":typ, "orb":orb})
+                aspects.append({"a": planets[i]["name"], "b": planets[j]["name"], "type": typ, "orb": orb})
 
     houses_out = []
     for i, cusp in enumerate(cusps, start=1):
         sname, deg = sign_name(cusp)
-        houses_out.append({"num":i, "lon":round(norm360(cusp),6), "sign":sname, "deg_in_sign":round(deg,2)})
+        houses_out.append({
+            "num": i,
+            "lon": round(norm360(cusp), 6),
+            "sign": sname,
+            "deg_in_sign": round(deg, 2)
+        })
 
     return jsonify({
         "resolved": {
             "lat": lat, "lon": lon, "timezone": tz_name,
             "ut": ut_dt.strftime("%Y-%m-%d %H:%M"), "jd_ut": jd_ut
         },
-        "ascendant": round(norm360(ascv),6),
-        "mc": round(norm360(mcv),6),
+        "ascendant": round(norm360(ascv), 6),
+        "mc": round(norm360(mcv), 6),
         "planets": planets,
         "houses": houses_out,
         "aspects": aspects
@@ -169,16 +199,19 @@ def natal():
 @app.post("/transits")
 def transits():
     ip = request.remote_addr or "anon"
-    if not check_rate(ip): return jsonify({"error":"rate limit"}), 429
-    if not require_key(): return jsonify({"error":"unauthorized"}), 401
+    if not check_rate(ip):
+        return jsonify({"error": "rate limit"}), 429
+    if not require_key():
+        return jsonify({"error": "unauthorized"}), 401
     try:
         p = request.get_json(force=True)
     except Exception:
-        return jsonify({"error":"Invalid JSON"}), 400
+        return jsonify({"error": "Invalid JSON"}), 400
 
     # natal base
     basis, err = natal_payload(p, require_geo=True)
-    if err: return jsonify(err), 400
+    if err:
+        return jsonify(err), 400
     tz_name = basis["tz"]
 
     # transit time
@@ -192,7 +225,7 @@ def transits():
         time_s = p.get("t_time") or p.get("time")
         tz_name = p.get("t_timezone") or tz_name
         if not (date and time_s and tz_name):
-            return jsonify({"error":"t_date/time & t_timezone (or now:true) required"}), 400
+            return jsonify({"error": "t_date/time & t_timezone (or now:true) required"}), 400
 
     jd_ut, ut_dt = local_to_ut(date, time_s, tz_name)
 
@@ -212,7 +245,7 @@ def transits():
                 # rough days-to-exact estimate (very approximate)
                 rel_speed = abs(t["speed"]) or 1e-6
                 delta = abs(((t["lon"] - n["lon"]) + 540) % 360 - 180)
-                approx_days = round(delta / (rel_speed*(24.0)), 1)
+                approx_days = round(delta / (rel_speed * 24.0), 1)
                 hits.append({
                     "transiting": t["name"],
                     "natal": n["name"],
